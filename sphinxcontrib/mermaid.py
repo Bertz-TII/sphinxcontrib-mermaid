@@ -489,6 +489,8 @@ def setup(app):
         texinfo=(texinfo_visit_mermaid, None),
         text=(text_visit_mermaid, None),
         man=(man_visit_mermaid, None),
+        epub = (html_visit_mermaid, None),
+        # rinoh = (latex_visit_mermaid, None)
     )
     app.add_directive("mermaid", Mermaid)
     app.add_directive("autoclasstree", MermaidClassDiagram)
