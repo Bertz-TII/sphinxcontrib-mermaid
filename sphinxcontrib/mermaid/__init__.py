@@ -1,13 +1,14 @@
 """
-    sphinx-mermaid
-    ~~~~~~~~~~~~~~~
+sphinx-mermaid
+~~~~~~~~~~~~~~~
 
-    Allow mermaid diagrams to be included in Sphinx-generated
-    documents inline.
+Allow mermaid diagrams to be included in Sphinx-generated
+documents inline.
 
-    :copyright: Copyright 2016-2023 by Martín Gaitán and others
-    :license: BSD, see LICENSE for details.
+:copyright: Copyright 2016-2023 by Martín Gaitán and others
+:license: BSD, see LICENSE for details.
 """
+
 from __future__ import annotations
 
 import codecs
@@ -15,20 +16,24 @@ import errno
 import os
 import posixpath
 import re
-from hashlib import sha1
-from subprocess import PIPE, Popen
-from tempfile import _get_default_tempdir
+import shlex
 import uuid
+from hashlib import sha1
+from json import loads
+from subprocess import PIPE, Popen
+from tempfile import TemporaryDirectory
 
 import sphinx
 from docutils import nodes
 from docutils.parsers.rst import Directive, directives
 from docutils.statemachine import ViewList
+from packaging.version import Version
 from sphinx.application import Sphinx
 from sphinx.locale import _
 from sphinx.util import logging
 from sphinx.util.i18n import search_image_for_language
 from sphinx.util.osutil import ensuredir
+from yaml import dump
 
 from .autoclassdiag import class_diagram
 from .exceptions import MermaidError
@@ -36,6 +41,45 @@ from .exceptions import MermaidError
 logger = logging.getLogger(__name__)
 
 mapname_re = re.compile(r'<map id="(.*?)"')
+_MERMAID_INIT_JS_DEFAULT = "mermaid.initialize({startOnLoad:false});"
+_MERMAID_RUN_NO_D3_ZOOM = """
+import mermaid from "{mermaid_js_url}";
+window.addEventListener("load", () => mermaid.run());
+"""
+
+_MERMAID_RUN_D3_ZOOM = """
+import mermaid from "{mermaid_js_url}";
+const load = async () => {{
+    await mermaid.run();
+    const all_mermaids = document.querySelectorAll(".mermaid");
+    const mermaids_to_add_zoom = {d3_node_count} === -1 ? all_mermaids.length : {d3_node_count};
+    const mermaids_processed = document.querySelectorAll(".mermaid[data-processed='true']");
+    if(mermaids_to_add_zoom > 0) {{
+        var svgs = d3.selectAll("{d3_selector}");
+        if(all_mermaids.length !== mermaids_processed.length) {{
+            // try again in a sec, wait for mermaids to load
+            setTimeout(load, 200);
+            return;
+        }} else if(svgs.size() !== mermaids_to_add_zoom) {{
+            // try again in a sec, wait for mermaids to load
+            setTimeout(load, 200);
+            return;
+        }} else {{
+            svgs.each(function() {{
+                var svg = d3.select(this);
+                svg.html("<g class='wrapper'>" + svg.html() + "</g>");
+                var inner = svg.select("g");
+                var zoom = d3.zoom().on("zoom", function(event) {{
+                    inner.attr("transform", event.transform);
+                }});
+                svg.call(zoom);
+            }});
+        }}
+    }}
+}};
+
+window.addEventListener("load", load);
+"""
 
 
 class mermaid(nodes.General, nodes.Inline, nodes.Element):
@@ -48,9 +92,7 @@ def figure_wrapper(directive, node, caption):
         figure_node["align"] = node.attributes.pop("align")
 
     parsed = nodes.Element()
-    directive.state.nested_parse(
-        ViewList([caption], source=""), directive.content_offset, parsed
-    )
+    directive.state.nested_parse(ViewList([caption], source=""), directive.content_offset, parsed)
     caption_node = nodes.caption(parsed[0].rawsource, "", *parsed[0].children)
     caption_node.source = parsed[0].source
     caption_node.line = parsed[0].line
@@ -72,10 +114,15 @@ class Mermaid(Directive):
     optional_arguments = 1
     final_argument_whitespace = False
     option_spec = {
+        # Sphinx directives
+        "name": directives.unchanged,
         "alt": directives.unchanged,
         "align": align_spec,
         "caption": directives.unchanged,
         "zoom": directives.unchanged,
+        # Mermaid directives
+        "config": directives.unchanged,
+        "title": directives.unchanged,
     }
 
     def get_mm_code(self):
@@ -85,8 +132,7 @@ class Mermaid(Directive):
             if self.content:
                 return [
                     document.reporter.warning(
-                        "Mermaid directive cannot have both content and "
-                        "a filename argument",
+                        "Mermaid directive cannot have both content and " "a filename argument",
                         line=self.lineno,
                     )
                 ]
@@ -100,8 +146,7 @@ class Mermaid(Directive):
             except OSError:
                 return [
                     document.reporter.warning(
-                        "External Mermaid file %r not found or reading "
-                        "it failed" % filename,
+                        "External Mermaid file %r not found or reading " "it failed" % filename,
                         line=self.lineno,
                     )
                 ]
@@ -110,7 +155,7 @@ class Mermaid(Directive):
             mmcode = "\n".join(self.content)
         return mmcode
 
-    def run(self):
+    def run(self, **kwargs):
         mmcode = self.get_mm_code()
         # mmcode is a list, so it's a system message, not content to be included in the
         # document.
@@ -130,6 +175,7 @@ class Mermaid(Directive):
         node = mermaid()
         node["code"] = mmcode
         node["options"] = {}
+        # Sphinx directives
         if "alt" in self.options:
             node["alt"] = self.options["alt"]
         if "align" in self.options:
@@ -140,15 +186,27 @@ class Mermaid(Directive):
             node["zoom"] = True
             node["zoom_id"] = f"id-{uuid.uuid4()}"
 
+        # Mermaid directives
+        mm_config = "---"
+        if "config" in self.options:
+            mm_config += "\n"
+            mm_config += dump({"config": loads(self.options["config"])})
+        if "title" in self.options:
+            mm_config += "\n"
+            mm_config += f"title: {self.options['title']}"
+        mm_config += "\n---\n"
+        if mm_config != "---\n---\n":
+            node["code"] = mm_config + node["code"]
+
         caption = self.options.get("caption")
-        if caption:
+        if caption is not None:
             node = figure_wrapper(self, node, caption)
 
+        self.add_name(node)
         return [node]
 
 
 class MermaidClassDiagram(Mermaid):
-
     has_content = False
     required_arguments = 1
     optional_arguments = 100
@@ -178,101 +236,81 @@ def render_mm(self, code, options, _fmt, prefix="mermaid"):
 
     mermaid_cmd = self.builder.config.mermaid_cmd
     mermaid_cmd_shell = self.builder.config.mermaid_cmd_shell in {True, "True", "true"}
-    hashkey = (
-        code + str(options) + str(self.builder.config.mermaid_sequence_config)
-    ).encode("utf-8")
+    hashkey = (code + str(options) + str(self.builder.config.mermaid_sequence_config)).encode("utf-8")
 
     basename = f"{prefix}-{sha1(hashkey).hexdigest()}"
     fname = f"{basename}.{_fmt}"
     relfn = posixpath.join(self.builder.imgpath, fname)
     outdir = os.path.join(self.builder.outdir, self.builder.imagedir)
     outfn = os.path.join(outdir, fname)
-    tmpfn = os.path.join(_get_default_tempdir(), basename)
+    with TemporaryDirectory() as tempDir:
+        tmpfn = os.path.join(tempDir, basename)
 
-    if os.path.isfile(outfn):
+        if os.path.isfile(outfn):
+            return relfn, outfn
+
+        ensuredir(os.path.dirname(outfn))
+
+        with open(tmpfn, "w", encoding="utf-8") as t:
+            t.write(code)
+
+        if isinstance(mermaid_cmd, str):
+            mm_args = shlex.split(mermaid_cmd)
+        else:
+            mm_args = list(mermaid_cmd)
+
+        mm_args.extend(self.builder.config.mermaid_params)
+        mm_args += ["-i", tmpfn, "-o", outfn]
+        if self.builder.config.mermaid_sequence_config:
+            mm_args.extend(["--configFile", self.builder.config.mermaid_sequence_config])
+
+        try:
+            p = Popen(mm_args, shell=mermaid_cmd_shell, stdout=PIPE, stdin=PIPE, stderr=PIPE)
+        except FileNotFoundError:
+            logger.warning("command %r cannot be run (needed for mermaid " "output), check the mermaid_cmd setting" % mermaid_cmd)
+            return None, None
+
+        stdout, stderr = p.communicate(str.encode(code))
+        if self.builder.config.mermaid_verbose:
+            logger.info(stdout)
+
+        if p.returncode != 0:
+            raise MermaidError("Mermaid exited with error:\n[stderr]\n%s\n" "[stdout]\n%s" % (stderr, stdout))
+        if not os.path.isfile(outfn):
+            raise MermaidError("Mermaid did not produce an output file:\n[stderr]\n%s\n" "[stdout]\n%s" % (stderr, stdout))
         return relfn, outfn
 
-    ensuredir(os.path.dirname(outfn))
 
-    with open(tmpfn, "w") as t:
-        t.write(code)
+def _render_mm_html_raw(self, node, code, options, prefix="mermaid", imgcls=None, alt=None):
+    classes = ["mermaid"]
+    attrs = {}
 
-    mm_args = [mermaid_cmd, "-i", tmpfn, "-o", outfn]
-    mm_args.extend(self.builder.config.mermaid_params)
-    if self.builder.config.mermaid_sequence_config:
-        mm_args.extend("--configFile", self.builder.config.mermaid_sequence_config)
+    if "align" in node:
+        classes.append(f"align-{node['align']}")
+        attrs["align"] = node["align"]
 
-    try:
-        p = Popen(
-            mm_args, shell=mermaid_cmd_shell, stdout=PIPE, stdin=PIPE, stderr=PIPE
-        )
-    except FileNotFoundError:
-        logger.warning(
-            "command %r cannot be run (needed for mermaid "
-            "output), check the mermaid_cmd setting" % mermaid_cmd
-        )
-        return None, None
+    if "zoom_id" in node:
+        attrs["data-zoom-id"] = node["zoom_id"]
 
-    stdout, stderr = p.communicate(str.encode(code))
-    if self.builder.config.mermaid_verbose:
-        logger.info(stdout)
+    if "ids" in node and len(node["ids"]) == 1:
+        attrs["id"] = node["ids"][0]
 
-    if p.returncode != 0:
-        raise MermaidError(
-            "Mermaid exited with error:\n[stderr]\n%s\n"
-            "[stdout]\n%s" % (stderr, stdout)
-        )
-    if not os.path.isfile(outfn):
-        raise MermaidError(
-            "Mermaid did not produce an output file:\n[stderr]\n%s\n"
-            "[stdout]\n%s" % (stderr, stdout)
-        )
-    return relfn, outfn
-
-
-def _render_mm_html_raw(
-    self, node, code, options, prefix="mermaid", imgcls=None, alt=None
-):
-    if "align" in node and "zoom_id" in node:
-        tag_template = """<div align="{align}" id="{zoom_id}" class="mermaid align-{align}">
-            {code}
-        </div>
-        """
-    elif "align" in node and "zoom_id" not in node:
-        tag_template = """<div align="{align}" class="mermaid align-{align}">
-            {code}
-        </div>
-        """
-    elif "align" not in node and "zoom_id" in node:
-        tag_template = """<div id="{zoom_id}" class="mermaid">
-            {code}
-        </div>
-        """
-    else:
-        tag_template = """<div class="mermaid">
-            {code}
-        </div>"""
-
-    self.body.append(
-        tag_template.format(align=node.get("align"), zoom_id=node.get("zoom_id"), code=self.encode(code))
-    )
+    tag_template = """<pre {attr_defs} class="{classes}">
+        {code}
+    </pre>"""
+    attr_defs = ['{}="{}"'.format(k, v) for k, v in attrs.items()]
+    self.body.append(tag_template.format(attr_defs=" ".join(attr_defs), classes=" ".join(classes), code=self.encode(code)))
     raise nodes.SkipNode
 
 
 def render_mm_html(self, node, code, options, prefix="mermaid", imgcls=None, alt=None):
-
     _fmt = self.builder.config.mermaid_output_format
     if _fmt == "raw":
-        return _render_mm_html_raw(
-            self, node, code, options, prefix="mermaid", imgcls=None, alt=None
-        )
+        return _render_mm_html_raw(self, node, code, options, prefix="mermaid", imgcls=None, alt=None)
 
     try:
         if _fmt not in ("png", "svg"):
-            raise MermaidError(
-                "mermaid_output_format must be one of 'raw', 'png', "
-                "'svg', but is %r" % _fmt
-            )
+            raise MermaidError("mermaid_output_format must be one of 'raw', 'png', " "'svg', but is %r" % _fmt)
 
         fname, outfn = render_mm(self, code, options, _fmt, prefix)
     except MermaidError as exc:
@@ -292,13 +330,11 @@ def render_mm_html(self, node, code, options, prefix="mermaid", imgcls=None, alt
             self.body.append(svgtag)
         else:
             if "align" in node:
-                self.body.append(
-                    '<div align="%s" class="align-%s">' % (node["align"], node["align"])
-                )
+                self.body.append('<pre align="%s" class="align-%s">' % (node["align"], node["align"]))
 
             self.body.append(f'<img src="{fname}" alt="{alt}" {imgcss}/>\n')
             if "align" in node:
-                self.body.append("</div>\n")
+                self.body.append("</pre>\n")
 
     raise nodes.SkipNode
 
@@ -319,11 +355,9 @@ def render_mm_latex(self, node, code, options, prefix="mermaid"):
         try:
             p = Popen(mm_args, stdout=PIPE, stdin=PIPE, stderr=PIPE)
         except OSError as err:
-            if err.errno != errno.ENOENT:   # No such file or directory
+            if err.errno != errno.ENOENT:  # No such file or directory
                 raise
-            logger.warning(
-                f"command {self.builder.config.mermaid_pdfcrop!r} cannot be run (needed to crop pdf), check the mermaid_cmd setting"
-            )
+            logger.warning(f"command {self.builder.config.mermaid_pdfcrop!r} cannot be run (needed to crop pdf), check the mermaid_cmd setting")
             return None, None
 
         stdout, stderr = p.communicate()
@@ -331,19 +365,11 @@ def render_mm_latex(self, node, code, options, prefix="mermaid"):
             logger.info(stdout)
 
         if p.returncode != 0:
-            raise MermaidError(
-                "PdfCrop exited with error:\n[stderr]\n%s\n"
-                "[stdout]\n%s" % (stderr, stdout)
-            )
+            raise MermaidError("PdfCrop exited with error:\n[stderr]\n%s\n" "[stdout]\n%s" % (stderr, stdout))
         if not os.path.isfile(outfn):
-            raise MermaidError(
-                "PdfCrop did not produce an output file:\n[stderr]\n%s\n"
-                "[stdout]\n%s" % (stderr, stdout)
-            )
+            raise MermaidError("PdfCrop did not produce an output file:\n[stderr]\n%s\n" "[stdout]\n%s" % (stderr, stdout))
 
-        fname = "{filename[0]}-crop{filename[1]}".format(
-            filename=os.path.splitext(fname)
-        )
+        fname = "{filename[0]}-crop{filename[1]}".format(filename=os.path.splitext(fname))
 
     is_inline = self.is_inline(node)
     if is_inline:
@@ -360,9 +386,7 @@ def render_mm_latex(self, node, code, options, prefix="mermaid"):
             elif node["align"] == "right":
                 self.body.append("{\\hspace*{\\fill}")
                 post = "}"
-        self.body.append(
-            "%s\\sphinxincludegraphics{%s}%s" % (para_separator, fname, para_separator)
-        )
+        self.body.append("%s\\sphinxincludegraphics{%s}%s" % (para_separator, fname, para_separator))
         if post:
             self.body.append(post)
 
@@ -416,69 +440,78 @@ def install_js(
         return
 
     # Add required JavaScript
-    if not app.config.mermaid_version:
-        _mermaid_js_url = None  # assume it is local
+    if app.config.mermaid_use_local:
+        _mermaid_js_url = app.config.mermaid_use_local
     elif app.config.mermaid_version == "latest":
-        _mermaid_js_url = "https://unpkg.com/mermaid/dist/mermaid.min.js"
+        _mermaid_js_url = "https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.esm.min.mjs"
+    elif Version(app.config.mermaid_version) > Version("10.2.0"):
+        _mermaid_js_url = f"https://cdn.jsdelivr.net/npm/mermaid@{app.config.mermaid_version}/dist/mermaid.esm.min.mjs"
+    elif app.config.mermaid_version:
+        raise MermaidError("Requires mermaid js version 10.3.0 or later")
+
+    app.add_js_file(_mermaid_js_url, priority=app.config.mermaid_js_priority, type="module")
+
+    if app.config.mermaid_elk_use_local:
+        _mermaid_elk_js_url = app.config.mermaid_elk_use_local
+    elif app.config.mermaid_include_elk == "latest":
+        _mermaid_elk_js_url = "https://cdn.jsdelivr.net/npm/@mermaid-js/layout-elk/dist/mermaid-layout-elk.esm.min.mjs"
+    elif app.config.mermaid_include_elk:
+        _mermaid_elk_js_url = (
+            f"https://cdn.jsdelivr.net/npm/@mermaid-js/layout-elk@{app.config.mermaid_include_elk}/dist/mermaid-layout-elk.esm.min.mjs"
+        )
     else:
-        _mermaid_js_url = f"https://unpkg.com/mermaid@{app.config.mermaid_version}/dist/mermaid.min.js"
-    if _mermaid_js_url:
-        app.add_js_file(_mermaid_js_url, priority=app.config.mermaid_js_priority)
+        _mermaid_elk_js_url = None
+    if _mermaid_elk_js_url:
+        app.add_js_file(_mermaid_elk_js_url, priority=app.config.mermaid_js_priority, type="module")
+
+    if app.config.mermaid_init_js == _MERMAID_INIT_JS_DEFAULT:
+        # Update if esm is used and no custom init-js is provided
+        if _mermaid_elk_js_url:
+            # Add registration of ELK layouts
+            app.config.mermaid_init_js = f'import mermaid from "{_mermaid_js_url}";import elkLayouts from "{_mermaid_elk_js_url}";mermaid.registerLayoutLoaders(elkLayouts);{app.config.mermaid_init_js}'
+        else:
+            app.config.mermaid_init_js = f'import mermaid from "{_mermaid_js_url}";{app.config.mermaid_init_js}'
 
     if app.config.mermaid_init_js:
         # If mermaid is local the init-call must be placed after `html_js_files` which has a priority of 800.
-        priority = (
-            app.config.mermaid_init_js_priority if _mermaid_js_url is not None else 801
-        )
-        app.add_js_file(None, body=app.config.mermaid_init_js, priority=priority)
+        priority = app.config.mermaid_init_js_priority if _mermaid_js_url is not None else 801
+        app.add_js_file(None, body=app.config.mermaid_init_js, priority=priority, type="module")
 
+    _wrote_mermaid_run = False
     if app.config.mermaid_output_format == "raw":
+        if app.config.d3_use_local:
+            _d3_js_url = app.config.d3_use_local
+        elif app.config.d3_version == "latest":
+            _d3_js_url = "https://cdn.jsdelivr.net/npm/d3/dist/d3.min.js"
+        elif app.config.d3_version:
+            _d3_js_url = f"https://cdn.jsdelivr.net/npm/d3@{app.config.d3_version}/dist/d3.min.js"
+        app.add_js_file(_d3_js_url, priority=app.config.mermaid_js_priority)
+
         if app.config.mermaid_d3_zoom:
-            _d3_js_url = "https://unpkg.com/d3/dist/d3.min.js"
-            _d3_js_script = """
-            window.addEventListener("load", function () {
-              var svgs = d3.selectAll(".mermaid svg");
-              svgs.each(function() {
-                var svg = d3.select(this);
-                svg.html("<g>" + svg.html() + "</g>");
-                var inner = svg.select("g");
-                var zoom = d3.zoom().on("zoom", function(event) {
-                  inner.attr("transform", event.transform);
-                });
-                svg.call(zoom);
-              });
-            });
-            """
-            app.add_js_file(_d3_js_url, priority=app.config.mermaid_js_priority)
-            app.add_js_file(None, body=_d3_js_script, priority=app.config.mermaid_js_priority)
+            _d3_js_script = _MERMAID_RUN_D3_ZOOM.format(d3_selector=".mermaid svg", d3_node_count=-1, mermaid_js_url=_mermaid_js_url)
+            app.add_js_file(None, body=_d3_js_script, priority=app.config.mermaid_js_priority, type="module")
+            _wrote_mermaid_run = True
         elif doctree:
             mermaid_nodes = doctree.findall(mermaid)
             _d3_selector = ""
+            count = 0
             for mermaid_node in mermaid_nodes:
                 if "zoom_id" in mermaid_node:
                     _zoom_id = mermaid_node["zoom_id"]
                     if _d3_selector == "":
-                        _d3_selector += f".mermaid#{_zoom_id} svg"
+                        _d3_selector += f".mermaid[data-zoom-id={_zoom_id}] svg"
                     else:
-                        _d3_selector += f", .mermaid#{_zoom_id} svg"
+                        _d3_selector += f", .mermaid[data-zoom-id={_zoom_id}] svg"
+                    count += 1
             if _d3_selector != "":
-                _d3_js_url = "https://unpkg.com/d3/dist/d3.min.js"
-                _d3_js_script = f"""
-                window.addEventListener("load", function () {{
-                  var svgs = d3.selectAll("{_d3_selector}");
-                  svgs.each(function() {{
-                    var svg = d3.select(this);
-                    svg.html("<g>" + svg.html() + "</g>");
-                    var inner = svg.select("g");
-                    var zoom = d3.zoom().on("zoom", function(event) {{
-                      inner.attr("transform", event.transform);
-                    }});
-                    svg.call(zoom);
-                  }});
-                }});
-                """
-                app.add_js_file(_d3_js_url, priority=app.config.mermaid_js_priority)
-                app.add_js_file(None, body=_d3_js_script, priority=app.config.mermaid_js_priority)
+                _d3_js_script = _MERMAID_RUN_D3_ZOOM.format(d3_selector=_d3_selector, d3_node_count=count, mermaid_js_url=_mermaid_js_url)
+                app.add_js_file(None, body=_d3_js_script, priority=app.config.mermaid_js_priority, type="module")
+                _wrote_mermaid_run = True
+
+    if not _wrote_mermaid_run and _mermaid_js_url:
+        app.add_js_file(
+            None, body=_MERMAID_RUN_NO_D3_ZOOM.format(mermaid_js_url=_mermaid_js_url), priority=app.config.mermaid_js_priority, type="module"
+        )
 
 
 def setup(app):
@@ -500,17 +533,16 @@ def setup(app):
     app.add_config_value("mermaid_params", list(), "html")
     app.add_config_value("mermaid_verbose", False, "html")
     app.add_config_value("mermaid_sequence_config", False, "html")
-    
-    # Starting in version 10, mermaid is an "ESM only" package
-    # thus it requires a different initialization code not yet supported. 
-    # So the current latest version supported is this
-    # Discussion: https://github.com/mermaid-js/mermaid/discussions/4148
-    app.add_config_value("mermaid_version", "10.2.0", "html")
+
+    app.add_config_value("mermaid_use_local", "", "html")
+    app.add_config_value("mermaid_version", "11.2.0", "html")
+    app.add_config_value("mermaid_elk_use_local", "", "html")
+    app.add_config_value("mermaid_include_elk", "0.1.4", "html")
     app.add_config_value("mermaid_js_priority", 500, "html")
     app.add_config_value("mermaid_init_js_priority", 500, "html")
-    app.add_config_value(
-        "mermaid_init_js", "mermaid.initialize({startOnLoad:true});", "html"
-    )
+    app.add_config_value("mermaid_init_js", _MERMAID_INIT_JS_DEFAULT, "html")
+    app.add_config_value("d3_use_local", "", "html")
+    app.add_config_value("d3_version", "7.9.0", "html")
     app.add_config_value("mermaid_d3_zoom", False, "html")
     app.connect("html-page-context", install_js)
 
