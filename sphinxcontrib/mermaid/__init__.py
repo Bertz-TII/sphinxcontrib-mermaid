@@ -265,6 +265,7 @@ def render_mm(self, code, options, _fmt, prefix="mermaid"):
             mm_args.extend(["--configFile", self.builder.config.mermaid_sequence_config])
 
         try:
+            print(mm_args)
             p = Popen(mm_args, shell=mermaid_cmd_shell, stdout=PIPE, stdin=PIPE, stderr=PIPE)
         except FileNotFoundError:
             logger.warning("command %r cannot be run (needed for mermaid output), check the mermaid_cmd setting" % mermaid_cmd)
