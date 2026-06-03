@@ -64,6 +64,7 @@ instance/
 .scrapy
 
 # Sphinx documentation
+docs/index.md
 docs/_build/
 
 # PyBuilder
@@ -94,3 +95,7 @@ ENV/
 
 # IDEA project settings
 .idea
+
+# Test directories (for manual theme testing)
+test-fullscreen/
+theme-tests/
